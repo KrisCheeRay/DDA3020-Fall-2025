@@ -1,0 +1,211 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2026_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\title{A Robust SFT-GRPO Pipeline for Hull Tactical Market Prediction}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{Yiteng Mao (123090419), Rui Cai (123090007), Yixi Cai (123090010) \& Zirun Zheng (123090891) \\
+The Chinese University of Hong Kong, Shenzhen\\
+Shenzhen, China \\
+\texttt{\{123090419, 123090007, 123090010, 123090891\}@link.cuhk.edu.cn}
+}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Financial market prediction is characterized by high noise, non-stationarity, and evolving distributions. In this course project for the Kaggle Hull Tactical Market Prediction competition, we propose a two-stage end-to-end framework: \textbf{Supervised Fine-Tuning (SFT)} followed by \textbf{Generalized Reinforcement Policy Optimization (GRPO)}. Unlike traditional approaches that rely solely on regression loss, we decouple signal generation from decision-making. First, we perform rigorous feature engineering to select stable predictive factors. Second, we conducted a comparative analysis between Transformer-based (PatchTST) and MLP-based (N-HiTS) models, ultimately selecting N-HiTS for its superior capability to capture strong negative correlations in key factors. We generate "Rotten Apple" OOS signals to simulate realistic errors. Finally, we train a Policy Network (MLP) using Reinforcement Learning to optimize a comprehensive reward function ($PnL - Risk - Turnover$). Our approach achieved a public leaderboard score of \textbf{0.431}.
+\end{abstract}
+
+\section{Introduction}
+
+Predicting stock market returns is a notoriously difficult task due to the low signal-to-noise ratio and the dynamic nature of financial data \citep{hull2017return}. The Hull Tactical Market Prediction competition challenges participants to forecast future returns using a provided set of proprietary features. A key challenge in such competitions is the disconnect between the surrogate loss function used in training (e.g., Mean Squared Error) and the ultimate financial objective (e.g., Profit and Loss, Sharpe Ratio).
+
+To address this, we developed a pipeline that separates \textit{signal generation} from \textit{decision making}. We treat the base model's predictions not as the final answer, but as a probabilistic feature state for a Reinforcement Learning (RL) agent. This allows the agent to learn a policy that adapts to the base model's uncertainty, balancing risk and return dynamically. 
+
+Our contributions are as follows:
+\begin{itemize}
+    \item A systematic feature selection process based on Information Coefficient (IC), Information Ratio (IR), and group return monotonicity.
+    \item A data-driven model selection process where we identified that simple MLPs (N-HiTS) outperform complex Transformers (PatchTST) due to the presence of strong linear factors.
+    \item A "Rotten Apple" data generation mechanism that produces unbiased Out-of-Sample (OOS) signals for RL training, preventing look-ahead bias.
+    \item A GRPO-based Policy Network that optimizes a composite reward function of PnL, risk, and turnover.
+\end{itemize}
+
+\section{Data Exploration and Feature Engineering}
+
+The dataset consists of anonymized financial features. Given the "black box" nature of the features, statistical analysis was crucial to identify those with genuine predictive power.
+
+\subsection{Evaluation Metrics}
+We evaluated features using three key metrics:
+\begin{enumerate}
+    \item \textbf{Information Coefficient (IC) \& Rank IC}: The Pearson/Spearman correlation between the feature value and the forward return over a rolling window. A stable, high IC indicates predictive power.
+    \item \textbf{Information Ratio (IR)}: Defined as $IR = Mean(IC) / Std(IC)$, measuring the stability of the factor's predictive power.
+    \item \textbf{Grouped Returns}: We divided time periods into deciles based on feature values. A monotonic relationship between feature deciles and returns indicates strong discriminative ability.
+\end{enumerate}
+
+\subsection{Analysis and Selection}
+
+Our analysis revealed the presence of "Super Factors". Specifically, factors \texttt{E2} and \texttt{E3} exhibited a Rank IC of approximately \textbf{-0.15} with a negative Information Ratio (IR) exceeding \textbf{-2.3}. In quantitative finance, a Rank IC of 0.05 is typically considered strong; -0.15 indicates an exceptionally strong and stable negative linear relationship with returns.
+
+As shown in Figure \ref{fig:cic}, the Cumulative IC for feature \texttt{E2} approximates a straight line with a negative slope, confirming this stable negative correlation. Similarly, Figure \ref{fig:qcr} demonstrates that \texttt{E3} exhibits excellent monotonicity in grouped returns.
+
+\begin{figure}[h]
+\begin{center}
+\includegraphics[width=0.48\linewidth]{Analysis/e2_cic.png}
+\includegraphics[width=0.48\linewidth]{Analysis/e3_qcr.png}
+\end{center}
+\caption{Left: Cumulative IC and Rank IC for feature E2. Right: Grouped cumulative returns for feature E3.}
+\label{fig:cic}
+\label{fig:qcr}
+\end{figure}
+
+Initial screening selected 21 promising features. To reduce redundancy and multicollinearity, we computed the correlation matrix (Figure \ref{fig:corr}, Left). For pairs with correlation $> 0.7$, we retained the one with higher IR.
+
+\begin{figure}[h]
+\begin{center}
+\includegraphics[width=0.48\linewidth]{Analysis/f_corr_mat.png}
+\includegraphics[width=0.48\linewidth]{Analysis/2_2_f_corr_mat.png}
+\end{center}
+\caption{Left: Correlation matrix of initial features. Right: Correlation matrix of the final selected 8 features.}
+\label{fig:corr}
+\end{figure}
+
+The final selected set consists of 8 features: \texttt{["E2", "M13", "P8", "P5", "V9", "S2", "M12", "S5"]}. These features serve as the input for both our SFT models and the RL Policy Network. We use a \texttt{FeatureStore} to ensure consistent \texttt{StandardScaler} transformation between training and inference.
+
+\section{Methodology}
+
+Our architecture follows a "Sim-to-Real" philosophy, ensuring the training process mimics the uncertainty of the online inference environment.
+
+\subsection{Stage 1: Supervised Fine-Tuning (SFT)}
+
+\subsubsection{Model Selection: The PatchTST vs. N-HiTS Dilemma}
+In the initial phase, we experimented with two state-of-the-art time-series architectures: **PatchTST** (Transformer-based) \citep{nie2022time} and **N-HiTS** (MLP-based) \citep{challu2023nhits}. Our empirical results (Table \ref{tab:model_comparison}) strongly favored N-HiTS.
+
+\begin{table}[h]
+\caption{Performance Comparison on 10 Test Samples (Local Validation)}
+\label{tab:model_comparison}
+\begin{center}
+\begin{tabular}{lccc}
+\multicolumn{1}{c}{\bf Model}  &\multicolumn{1}{c}{\bf MSE} &\multicolumn{1}{c}{\bf IC (Corr)} &\multicolumn{1}{c}{\bf Hit Rate}
+\\ \hline \\
+PatchTST         &0.00007963 & -0.2466 & 50.00\% \\
+\textbf{N-HiTS}             &\textbf{0.00006249} & \textbf{0.0611} & \textbf{70.00\%} \\
+Ensemble         &0.00005537 & -0.1082 & 60.00\% \\
+\end{tabular}
+\end{center}
+\end{table}
+
+**Analysis of Failure (PatchTST):**
+PatchTST employs a Channel Independence (CI) strategy, treating each variable as an isolated univariate series. However, our data analysis showed that returns are driven by strong **cross-sectional factors** (E2, E3). PatchTST fails to model the explicit relationship $y \approx w \cdot E2 + b$ because it only looks at the history of $E2$ to predict $E2$, rather than using $E2$ to predict $y$. Consequently, it achieved a Hit Rate of only 50\% (random guess) and a negative IC, indicating overfitting to noise.
+
+**Analysis of Success (N-HiTS):**
+N-HiTS, despite being a time-series model, effectively functions as a stacked MLP that can perform multivariate regression. It successfully captured the strong linear signal from the "Super Factors" E2 and E3. The high Hit Rate (70\%) and positive IC confirm that N-HiTS learned the correct directional relationship, leveraging the strong alpha present in the selected features. Therefore, we adopted an "All-in N-HiTS" strategy.
+
+\subsubsection{The "Rotten Apple" Mechanism}
+To train the downstream RL agent effectively, we cannot feed it "perfect" predictions trained on the full dataset (which would cause look-ahead bias). Instead, we need signals that reflect the model's true out-of-sample errors. We implemented a **Rolling Cross-Validation** mechanism, which we term "Rotten Apples":
+
+\begin{equation}
+\hat{y}_{t} = f_{\theta_{t-k}}(\vx_{t})
+\end{equation}
+
+where the model $f$ used to predict at time $t$ is trained only on data up to $t-k$ (where $k$ is the forecast horizon). We generate these OOS predictions for the entire training history. This provides the RL agent with a realistic tuple $(\hat{y}_t, y_t, \text{Vol}_t)$ for every time step $t$.
+
+\subsection{Stage 2: Generalized Reinforcement Policy Optimization (GRPO)}
+We formulate the trading problem as a simplified Reinforcement Learning task. Since the environment (the market) does not react to our actions (assuming no market impact), we treat each day as a \textbf{single-step trajectory}.
+
+\subsubsection{State Space and Policy Network}
+The agent observes a state $s_t \in \mathbb{R}^{11}$ consisting of:
+\begin{itemize}
+    \item \textbf{Signal}: $\hat{y}_{t}$ (prediction from N-HiTS).
+    \item \textbf{Market State}: Rolling Volatility (std dev of returns) and Rolling Trend (mean of returns).
+    \item \textbf{Features}: The 8 selected raw financial features.
+\end{itemize}
+\textbf{Crucially, we explicitly include the raw features (especially E2, E3) in the state.} This allows the Policy Network to "see" the strong factors directly, enabling it to override the N-HiTS signal if necessary or learn a non-linear risk adjustment based on factor regimes.
+
+The Policy Network (Actor) is an MLP that maps state $s_t$ to the parameters of a Beta distribution, constrained to be positive via Softplus:
+\begin{equation}
+\alpha, \beta = \text{Softplus}(\text{MLP}(s_t)) + 1
+\end{equation}
+The action $a_t \in [0, 2]$ (representing position size) is sampled from this distribution:
+\begin{equation}
+a_t \sim 2 \cdot \text{Beta}(\alpha, \beta)
+\end{equation}
+During training, sampling encourages exploration. During inference, we use the expectation $\mathbb{E}[a_t] = 2 \cdot \frac{\alpha}{\alpha+\beta}$ for deterministic execution.
+
+\subsubsection{Reward Function and Optimization}
+We maximize a composite reward function $R_t$ designed to balance profit, risk, and transaction costs:
+\begin{equation}
+R_t = \underbrace{\text{PnL}_t}_{\text{Profit}} - \underbrace{\lambda_{risk} \cdot (a_t \cdot \sigma_t)^2}_{\text{Risk Penalty}} - \underbrace{\lambda_{turnover} \cdot |a_t - a_{t-1}| \cdot \text{Cost}}_{\text{Transaction Cost}}
+\end{equation}
+where $\text{PnL}_t = a_t \cdot y_t \cdot \text{ScaleFactor}$. The scale factor (e.g., 100) is crucial to prevent gradient vanishing given the small magnitude of daily returns.
+
+We optimize the policy using \textbf{Generalized Reinforcement Policy Optimization (GRPO)}, which simplifies PPO \citep{schulman2017proximal} by eliminating the value function critic and using the batch mean reward as the baseline for advantage estimation:
+\begin{equation}
+\nabla_\theta J(\theta) \approx \frac{1}{N} \sum_{i=1}^N \nabla_\theta \log \pi_\theta(a_i | s_i) \cdot (R_i - \bar{R}_{batch})
+\end{equation}
+
+\section{Evaluation}
+
+\subsection{Experimental Setup}
+The submission was evaluated using the Kaggle Evaluation API, which imposes strict constraints on inference time and internet access.
+\begin{itemize}
+    \item \textbf{Environment:} Kaggle Notebook (Offline). We utilized a custom offline package installation mechanism for \texttt{neuralforecast} \citep{garza2022neuralforecast} using pre-downloaded wheel files.
+    \item \textbf{Hyperparameters:} The Policy Network was trained for 50 epochs with a batch size of 128 and a learning rate of 1e-3 with StepLR scheduling.
+    \item \textbf{Cold Start Strategy:} A momentum-based heuristic ($\tanh(return \times 50)$) is used when the history window ($<60$ days) is insufficient for the N-HiTS model to form a prediction window.
+\end{itemize}
+
+\subsection{Results}
+
+\textbf{Local Validation:} 
+Our best policy achieved a significantly lower loss on the validation set compared to the baseline SFT signals. Qualitatively, the agent learned to reduce position sizes ($a_t \to 1.0$) during periods of high volatility, demonstrating successful risk aversion learning. This behavior was not explicitly programmed but emerged from the $\lambda_{risk}$ term in the reward function.
+
+\textbf{Kaggle Leaderboard Performance:}
+We successfully submitted our agent to the Kaggle competition. The inference pipeline functioned correctly without runtime errors, verifying the robustness of our engineering implementation.
+
+\begin{figure}[h]
+\begin{center}
+\includegraphics[width=0.9\linewidth]{Analysis/leaderboard_score.png}
+\end{center}
+\caption{Snapshot of our Public Leaderboard entry. We achieved a score of \textbf{0.431}, ranking 2923 at the time of submission.}
+\label{fig:leaderboard}
+\end{figure}
+
+As shown in Figure \ref{fig:leaderboard}, we achieved a public score of 0.431. While this score indicates room for improvement compared to the top leaderboard positions, it validates that our end-to-end pipeline—from feature engineering to RL inference—is functional and capable of generating positive signals.
+
+\section{Conclusion}
+
+In this project, we successfully implemented a sophisticated SFT-GRPO trading pipeline. By decoupling signal generation from portfolio decision-making, we created a flexible system capable of optimizing for complex financial objectives beyond simple MSE. 
+
+Key takeaways include:
+\begin{enumerate}
+    \item \textbf{Factor Analysis Drives Architecture:} The discovery of super-strong negative linear factors (E2/E3 with Rank IC -0.15) directly informed our decision to abandon PatchTST in favor of N-HiTS, which could better model these relationships.
+    \item \textbf{Honest Validation:} Generating "Rotten Apple" OOS signals is essential. Training an RL agent on "perfect" in-sample SFT predictions leads to severe overfitting and failure in online deployment.
+    \item \textbf{Infrastructure Matters:} Robust handling of online inference constraints (cold start, package management, memory management) is as important as the theoretical model itself.
+\end{enumerate}
+
+Future work will focus on refining the reward function hyperparameters to better capture market regimes and experimenting with TimesNet for potentially better multi-period forecasting.
+
+\bibliography{iclr2026_conference}
+\bibliographystyle{iclr2026_conference}
+
+\end{document}

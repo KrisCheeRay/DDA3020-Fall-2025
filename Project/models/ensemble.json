@@ -1,0 +1,7 @@
+{
+    "type": "fixed",
+    "weights": {
+        "patchtst": 0.0,
+        "nhits": 1.0
+    }
+}

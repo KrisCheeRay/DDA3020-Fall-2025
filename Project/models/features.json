@@ -1,0 +1,27 @@
+{
+  "feature_order": [
+    "E2",
+    "M13",
+    "P8",
+    "P5",
+    "V9",
+    "S2",
+    "M12",
+    "S5"
+  ],
+  "schema": {
+    "unique_id_col": "unique_id",
+    "timestamp_col": "ds",
+    "target_col": "forward_returns",
+    "feature_cols": [
+      "E2",
+      "M13",
+      "P8",
+      "P5",
+      "V9",
+      "S2",
+      "M12",
+      "S5"
+    ]
+  }
+}
